@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""Small, deterministic macOS command for the Laya Codex skill."""
+
+import argparse
+import datetime
+import json
+import platform
+import re
+import subprocess
+import sys
+import unicodedata
+from pathlib import Path
+
+from laya_app import resolve_app
+
+NIGHT_SONG_URL = "https://www.youtube.com/watch?v=Nc76PTAngtk&list=RDNc76PTAngtk&start_radio=1&t=0s"
+
+
+def normalized(prompt):
+    return " ".join(unicodedata.normalize("NFC", prompt).strip().split())
+
+
+def route(prompt):
+    original = unicodedata.normalize("NFC", prompt).strip()
+    text = normalized(original).casefold()
+    if not text:
+        raise ValueError("요청을 입력해 주세요. 예: laya 메모 켜줘")
+    if any(word in text for word in ("그리고", "한 다음", "그다음", "삭제", "지워", "종료", "닫아", "잠금")):
+        raise ValueError("한 번에 지원하는 동작 하나만 요청해 주세요.")
+
+    if re.fullmatch(r"(?:laya\s+)?하치왕왕\s*보여(?:줘|주세요)?", text):
+        return {"action": "hachiware_note_append", "params": {}}
+    if re.fullmatch(r"(?:laya\s+)?밤이\s*깊었네", text):
+        return {"action": "youtube_play", "params": {"url": NIGHT_SONG_URL}}
+
+    if "배터리" in text and any(word in text for word in ("상태", "잔량", "얼마", "알려", "보여", "확인")):
+        return {"action": "battery", "params": {}}
+    if any(word in text for word in ("맥 정보", "맥 상태", "시스템 정보", "mac 정보", "mac 상태")):
+        return {"action": "system_info", "params": {}}
+
+    if "볼륨" in text or "음량" in text:
+        numbers = re.findall(r"(?<!\d)\d{1,3}(?!\d)", text)
+        if numbers and any(word in text for word in ("설정", "맞춰", "바꿔")):
+            level = int(numbers[0])
+            if not 0 <= level <= 100:
+                raise ValueError("볼륨은 0부터 100까지 지정해 주세요.")
+            return {"action": "volume_set", "params": {"level": level}}
+        if any(word in text for word in ("상태", "몇", "알려", "보여", "확인")):
+            return {"action": "volume_get", "params": {}}
+
+    match = re.fullmatch(r"클립보드에\s+(.+?)\s+복사(?:해|해줘|해주세요)?", original)
+    if match:
+        return {"action": "clipboard_set", "params": {"text": match.group(1)}}
+    if "클립보드" in text and any(word in text for word in ("보여", "읽", "알려", "확인")):
+        return {"action": "clipboard_get", "params": {}}
+
+    if "스크린샷" in text and any(word in text for word in ("찍", "저장", "캡처")):
+        return {"action": "screenshot", "params": {}}
+    match = re.fullmatch(r"파일\s+(.+?)\s+찾아(?:줘|주세요)?", original)
+    if match:
+        return {"action": "file_search", "params": {"name": match.group(1)}}
+
+    try:
+        app = resolve_app(prompt)
+    except ValueError as exc:
+        raise ValueError("지원하지 않거나 모호한 요청입니다. `laya --help`에서 예시를 확인해 주세요.") from exc
+    return {"action": "launch_app", "params": {"app": app}}
+
+
+def command(*args, input_text=None, preserve=False):
+    try:
+        result = subprocess.run(args, input=input_text, capture_output=True, text=True,
+                                check=False, timeout=30)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"{args[0]} 명령이 30초 안에 끝나지 않았습니다.") from exc
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or f"{args[0]} 명령이 실패했습니다.")
+    return result.stdout if preserve else result.stdout.rstrip("\n")
+
+
+def execute(action, dry_run=False):
+    public_params = action["params"]
+    if action["action"] == "clipboard_set":
+        public_params = {"text_length": len(action["params"]["text"])}
+    result = {"engine": "fast-path-rule", "action": action["action"], "params": public_params}
+    if dry_run:
+        result["status"] = "dry-run"
+        return result
+    if platform.system() != "Darwin":
+        raise RuntimeError("실행은 macOS에서만 지원합니다.")
+
+    kind = action["action"]
+    params = action["params"]
+    if kind == "launch_app":
+        command("open", "-a", params["app"])
+        result["status"] = "launch-requested"
+    elif kind == "youtube_play":
+        command("open", params["url"])
+        result["status"] = "open-requested"
+    elif kind == "battery":
+        result["output"] = command("pmset", "-g", "batt")
+    elif kind == "system_info":
+        result["output"] = {
+            "macOS": command("sw_vers", "-productVersion"),
+            "architecture": platform.machine(),
+        }
+    elif kind == "volume_get":
+        result["output"] = command("osascript", "-e", "output volume of (get volume settings)")
+    elif kind == "volume_set":
+        command("osascript", "-e", f"set volume output volume {params['level']}")
+    elif kind == "clipboard_get":
+        result["output"] = command("pbpaste", preserve=True)
+    elif kind == "clipboard_set":
+        command("pbcopy", input_text=params["text"])
+    elif kind == "screenshot":
+        name = "laya-screenshot-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f") + ".png"
+        path = Path.cwd() / name
+        command("screencapture", "-x", str(path))
+        result["output"] = str(path)
+    elif kind == "file_search":
+        result["output"] = command("mdfind", "-name", params["name"]).splitlines()[:20]
+    elif kind == "hachiware_note_append":
+        from hachiware_note import append_hachiware_photo
+        result["output"] = append_hachiware_photo()
+    else:
+        raise ValueError(f"지원하지 않는 동작: {kind}")
+    result.setdefault("status", "completed")
+    return result
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="맥북 기본 기능을 한국어로 실행합니다. 예: laya 메모 켜줘",
+        epilog="예: laya 배터리 상태 알려줘 | laya 볼륨 30으로 설정해 | laya 하치왕왕 보여줘 | Laya 밤이 깊었네",
+    )
+    parser.add_argument("words", nargs="*", help="한국어 요청. 'run'을 앞에 붙여도 됩니다")
+    parser.add_argument("--dry-run", action="store_true", help="동작을 실행하지 않고 분류 결과만 표시")
+    parser.add_argument("--json", action="store_true", help="JSON 결과 출력")
+    args = parser.parse_args(argv)
+    words = args.words[1:] if args.words[:1] == ["run"] else args.words
+    try:
+        result = execute(route(" ".join(words)), dry_run=args.dry_run)
+    except (ValueError, RuntimeError, OSError) as exc:
+        print(f"오류: {exc}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False))
+    else:
+        if "output" in result:
+            output = result["output"]
+            print(json.dumps(output, ensure_ascii=False, indent=2) if isinstance(output, (dict, list)) else output)
+        else:
+            print(f"{result['action']}: {result['status']}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
